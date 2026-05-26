@@ -133,6 +133,12 @@ async def test_ping_command_returns_without_agent_call():
     runner._handle_message_with_agent.assert_not_called()
 
 
+def test_reset_session_alias_maps_to_new_command():
+    from hermes_cli.commands import resolve_command
+
+    assert resolve_command("reset-session").name == "new"
+
+
 @pytest.mark.asyncio
 async def test_queue_status_command_reports_provider_queue(monkeypatch):
     from gateway import provider_queue
