@@ -5570,6 +5570,15 @@ class GatewayRunner:
             "",
             f"**Connected Platforms:** {', '.join(connected_platforms)}",
         ])
+        try:
+            from gateway.provider_queue import ProviderQueue, format_snapshot
+
+            provider_queue = ProviderQueue.from_config(_load_gateway_config())
+            if provider_queue is not None:
+                lines.append("")
+                lines.extend(format_snapshot(provider_queue.snapshot()))
+        except Exception as exc:
+            logger.debug("Provider queue status unavailable: %s", exc)
 
         return "\n".join(lines)
 
@@ -10220,6 +10229,92 @@ class GatewayRunner:
 
             turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
 
+            provider_queue_lease = None
+            _ProviderQueueCancelled = None
+            try:
+                from gateway.provider_queue import (
+                    ProviderQueue,
+                    ProviderQueueCancelled as _ProviderQueueCancelled,
+                    format_start_notice,
+                    format_wait_notice,
+                    resolve_provider_account_identifier,
+                    resolve_provider_queue_lane,
+                )
+
+                _runtime_for_lane = turn_route.get("runtime") or {}
+                _queue_provider = _runtime_for_lane.get("provider")
+                _queue_model = turn_route.get("model")
+                _queue_account = resolve_provider_account_identifier(
+                    _queue_provider,
+                    api_key=_runtime_for_lane.get("api_key"),
+                )
+                _queue_lane = resolve_provider_queue_lane(
+                    user_config,
+                    provider=_queue_provider,
+                    model=_queue_model,
+                    account=_queue_account,
+                )
+                _provider_queue = ProviderQueue.from_config(user_config) if _queue_lane else None
+                if _provider_queue and _queue_lane:
+                    _queue_job = _provider_queue.enqueue(
+                        _queue_lane,
+                        session_key=session_key,
+                        source=source.platform.value if source.platform else "",
+                    )
+                    _wait_notice_sent = [False]
+
+                    def _send_provider_queue_notice(text: str) -> None:
+                        if not _status_adapter or not _run_still_current():
+                            return
+                        try:
+                            asyncio.run_coroutine_threadsafe(
+                                _status_adapter.send(
+                                    _status_chat_id,
+                                    text,
+                                    metadata=_status_thread_metadata,
+                                ),
+                                _loop_for_step,
+                            ).result(timeout=15)
+                        except Exception as _e:
+                            logger.debug("provider queue notice failed: %s", _e)
+
+                    def _provider_queue_wait_notice(state) -> None:
+                        _wait_notice_sent[0] = True
+                        _send_provider_queue_notice(format_wait_notice(state))
+
+                    provider_queue_lease = _queue_job.wait_for_turn(
+                        on_wait=_provider_queue_wait_notice,
+                        should_cancel=lambda: not _run_still_current(),
+                    )
+                    if _wait_notice_sent[0]:
+                        _state = _provider_queue.state_for_job(_queue_job.job_id)
+                        if _state:
+                            _send_provider_queue_notice(format_start_notice(_state))
+            except Exception as _queue_exc:
+                if (
+                    _ProviderQueueCancelled is not None
+                    and isinstance(_queue_exc, _ProviderQueueCancelled)
+                ):
+                    return {
+                        "final_response": "Stopped before the provider call started.",
+                        "messages": [],
+                        "api_calls": 0,
+                        "tools": [],
+                    }
+                if provider_queue_lease is not None:
+                    provider_queue_lease.finish("failed", str(_queue_exc))
+                    provider_queue_lease = None
+                logger.warning("Provider queue unavailable; provider call not started: %s", _queue_exc)
+                return {
+                    "final_response": (
+                        "Provider queue unavailable; the provider call was not started. "
+                        f"Error: {_queue_exc}"
+                    ),
+                    "messages": [],
+                    "api_calls": 0,
+                    "tools": [],
+                }
+
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
             # schemas for prompt cache hits.
@@ -10588,10 +10683,23 @@ class GatewayRunner:
                 else:
                     _run_message = message
 
-                result = agent.run_conversation(_run_message, conversation_history=agent_history, task_id=session_id)
+                try:
+                    result = agent.run_conversation(_run_message, conversation_history=agent_history, task_id=session_id)
+                except BaseException as _agent_exc:
+                    if provider_queue_lease is not None:
+                        provider_queue_lease.finish("failed", str(_agent_exc))
+                        provider_queue_lease = None
+                    raise
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 reset_current_session_key(_approval_session_token)
+            if provider_queue_lease is not None:
+                _queue_error = result.get("error") if isinstance(result, dict) else None
+                provider_queue_lease.finish(
+                    "failed" if _queue_error else "done",
+                    str(_queue_error) if _queue_error else None,
+                )
+                provider_queue_lease = None
             result_holder[0] = result
 
             # Signal the stream consumer that the agent is done
