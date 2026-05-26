@@ -59,6 +59,8 @@ class ProviderQueueSettings:
     retention_seconds: float = 7 * 24 * 3600.0
     rate_limit_cooldown_seconds: float = 180.0
     timeout_cooldown_seconds: float = 60.0
+    heavy_message_chars: int = 12000
+    heavy_priority: int = 10
     rules: tuple[dict[str, Any], ...] = DEFAULT_QUEUE_RULES
 
 
@@ -81,6 +83,7 @@ class ProviderQueueState:
     running: int
     queued_ahead: int
     position: int
+    priority: int = 0
     cooldown_until: float = 0.0
     acquired: bool = False
 
@@ -121,6 +124,8 @@ def load_provider_queue_settings(config: Mapping[str, Any] | None) -> ProviderQu
         retention_seconds=_positive_float(raw.get("retention_seconds"), 7 * 24 * 3600.0),
         rate_limit_cooldown_seconds=_positive_float(raw.get("rate_limit_cooldown_seconds"), 180.0),
         timeout_cooldown_seconds=_positive_float(raw.get("timeout_cooldown_seconds"), 60.0),
+        heavy_message_chars=max(1, int(_positive_float(raw.get("heavy_message_chars"), 12000))),
+        heavy_priority=max(1, int(_positive_float(raw.get("heavy_priority"), 10))),
         rules=rules,
     )
 
@@ -191,6 +196,25 @@ def resolve_provider_account_identifier(
     return "default"
 
 
+def classify_provider_queue_priority(
+    config: Mapping[str, Any] | None,
+    *,
+    message: Any,
+) -> int:
+    settings = load_provider_queue_settings(config)
+    raw = (config or {}).get("provider_queue") if isinstance(config, Mapping) else None
+    heavy_raw = raw.get("heavy_job") if isinstance(raw, Mapping) else None
+    heavy_enabled = _truthy(
+        heavy_raw.get("enabled") if isinstance(heavy_raw, Mapping) else None,
+        default=True,
+    )
+    if not heavy_enabled:
+        return 0
+    if len(str(message or "")) >= settings.heavy_message_chars:
+        return settings.heavy_priority
+    return 0
+
+
 class ProviderQueue:
     def __init__(self, settings: ProviderQueueSettings):
         self.settings = settings
@@ -211,6 +235,7 @@ class ProviderQueue:
         *,
         session_key: str | None,
         source: str | None,
+        priority: int = 0,
     ) -> "ProviderQueueJob":
         job_id = uuid.uuid4().hex
         now = time.time()
@@ -224,11 +249,12 @@ class ProviderQueue:
                     job_id, lane_key, status, priority, requested_at,
                     owner_id, owner_pid, session_key, source, model,
                     provider, account, display_name
-                ) VALUES (?, ?, 'queued', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
                     lane.lane_key,
+                    max(0, int(priority)),
                     now,
                     _owner_id(),
                     os.getpid(),
@@ -422,10 +448,10 @@ class ProviderQueue:
                 for row in conn.execute(
                     """
                     SELECT job_id, lane_key, status, requested_at, started_at,
-                           session_key, source, display_name
+                           priority, session_key, source, display_name
                     FROM provider_queue_jobs
                     WHERE status IN ('queued', 'running')
-                    ORDER BY requested_at, job_id
+                    ORDER BY priority, requested_at, job_id
                     LIMIT ?
                     """,
                     (limit,),
@@ -471,8 +497,8 @@ class ProviderQueue:
                     display_name TEXT,
                     error TEXT
                 );
-                CREATE INDEX IF NOT EXISTS idx_provider_queue_jobs_lane_status
-                    ON provider_queue_jobs(lane_key, status, requested_at, job_id);
+                CREATE INDEX IF NOT EXISTS idx_provider_queue_jobs_lane_status_priority
+                    ON provider_queue_jobs(lane_key, status, priority, requested_at, job_id);
                 CREATE INDEX IF NOT EXISTS idx_provider_queue_jobs_lease
                     ON provider_queue_jobs(status, lease_until);
                 """
@@ -540,9 +566,21 @@ class ProviderQueue:
             SELECT COUNT(*) FROM provider_queue_jobs
             WHERE lane_key = ?
               AND status = 'queued'
-              AND (requested_at < ? OR (requested_at = ? AND job_id < ?))
+              AND (
+                  priority < ?
+                  OR (priority = ? AND requested_at < ?)
+                  OR (priority = ? AND requested_at = ? AND job_id < ?)
+              )
             """,
-            (lane_key, row["requested_at"], row["requested_at"], row["job_id"]),
+            (
+                lane_key,
+                row["priority"],
+                row["priority"],
+                row["requested_at"],
+                row["priority"],
+                row["requested_at"],
+                row["job_id"],
+            ),
         ).fetchone()[0]
         position = max(1, int(queued_ahead or 0) + 1)
         return ProviderQueueState(
@@ -553,6 +591,7 @@ class ProviderQueue:
             running=int(running or 0),
             queued_ahead=int(queued_ahead or 0),
             position=position,
+            priority=int(row["priority"] or 0),
             cooldown_until=float(row["cooldown_until"] or 0),
             acquired=acquired,
         )
@@ -636,8 +675,9 @@ def format_wait_notice(state: ProviderQueueState) -> str:
     wait_part = ""
     if state.cooldown_until > time.time():
         wait_part = f", cooldown {int(state.wait_seconds)}s"
+    priority_part = " heavy" if state.priority > 0 else ""
     return (
-        f"Accepted. {state.display_name} queue position {state.position} "
+        f"Accepted. {state.display_name}{priority_part} queue position {state.position} "
         f"(running {state.running}/{state.concurrency}{wait_part})."
     )
 

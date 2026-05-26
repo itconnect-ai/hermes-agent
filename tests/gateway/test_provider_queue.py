@@ -4,6 +4,7 @@ import time
 
 from gateway.provider_queue import (
     ProviderQueue,
+    classify_provider_queue_priority,
     format_snapshot,
     load_provider_queue_settings,
     resolve_provider_account_identifier,
@@ -67,6 +68,33 @@ def test_fifo_acquire_respects_concurrency(tmp_path):
     queue.finish_job(first.job_id, "done")
     second_state = queue.try_acquire(second.job_id, lane)
     assert second_state.acquired is True
+
+
+def test_heavy_job_priority_yields_to_normal_job(tmp_path):
+    cfg = _config(tmp_path, heavy_message_chars=5, heavy_priority=10)
+    queue = ProviderQueue(load_provider_queue_settings(cfg))
+    lane = resolve_provider_queue_lane(
+        cfg,
+        provider="openai-codex",
+        model="gpt-5.5",
+        account="acct-1",
+    )
+
+    heavy_priority = classify_provider_queue_priority(cfg, message="long enough")
+    heavy = queue.enqueue(
+        lane,
+        session_key="discord:heavy",
+        source="discord",
+        priority=heavy_priority,
+    )
+    normal = queue.enqueue(lane, session_key="discord:normal", source="discord")
+
+    normal_state = queue.try_acquire(normal.job_id, lane)
+    assert normal_state.acquired is True
+
+    heavy_state = queue.try_acquire(heavy.job_id, lane)
+    assert heavy_state.acquired is False
+    assert heavy_state.priority == 10
 
 
 def test_expired_lease_releases_next_job(tmp_path):

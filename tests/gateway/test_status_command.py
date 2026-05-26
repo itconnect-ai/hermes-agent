@@ -114,6 +114,70 @@ async def test_status_command_includes_session_title_when_present():
 
 
 @pytest.mark.asyncio
+async def test_ping_command_returns_without_agent_call():
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=0,
+    )
+    runner = _make_runner(session_entry)
+    runner._handle_message_with_agent = AsyncMock(return_value="unexpected")
+
+    result = await runner._handle_message(_make_event("/ping"))
+
+    assert result == "pong"
+    runner._handle_message_with_agent.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_queue_status_command_reports_provider_queue(monkeypatch):
+    from gateway import provider_queue
+
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=0,
+    )
+    runner = _make_runner(session_entry)
+
+    class _Queue:
+        def snapshot(self):
+            return {
+                "lanes": [
+                    {
+                        "lane_key": "openai-codex:acct:gpt-5.5",
+                        "display_name": "GPT-5.5",
+                        "concurrency": 1,
+                        "running": 0,
+                        "queued": 0,
+                        "oldest_wait_seconds": 0,
+                        "cooldown_seconds": 0,
+                    }
+                ],
+                "jobs": [],
+            }
+
+    monkeypatch.setattr(
+        provider_queue.ProviderQueue,
+        "from_config",
+        classmethod(lambda cls, config: _Queue()),
+    )
+
+    result = await runner._handle_message(_make_event("/queue-status"))
+
+    assert "**Provider Queue:**" in result
+    assert "- GPT-5.5: running 0/1, queued 0, oldest wait 0s" in result
+
+
+@pytest.mark.asyncio
 async def test_agents_command_reports_active_agents_and_processes(monkeypatch):
     session_key = build_session_key(_make_source())
     session_entry = SessionEntry(

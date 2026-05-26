@@ -3617,8 +3617,13 @@ class GatewayRunner:
                 self._release_running_agent_state(_quick_key)
 
         if _quick_key in self._running_agents:
-            if event.get_command() == "status":
+            _running_command = event.get_command()
+            if _running_command == "status":
                 return await self._handle_status_command(event)
+            if _running_command == "ping":
+                return await self._handle_ping_command(event)
+            if _running_command in ("queue-status", "queues"):
+                return await self._handle_queue_status_command(event)
 
             # Resolve the command once for all early-intercept checks below.
             from hermes_cli.commands import (
@@ -3781,6 +3786,10 @@ class GatewayRunner:
                     return await self._handle_commands_command(event)
                 if _cmd_def_inner.name == "profile":
                     return await self._handle_profile_command(event)
+                if _cmd_def_inner.name == "ping":
+                    return await self._handle_ping_command(event)
+                if _cmd_def_inner.name == "queue-status":
+                    return await self._handle_queue_status_command(event)
                 if _cmd_def_inner.name == "update":
                     return await self._handle_update_command(event)
 
@@ -3972,6 +3981,12 @@ class GatewayRunner:
 
         if canonical == "status":
             return await self._handle_status_command(event)
+
+        if canonical == "ping":
+            return await self._handle_ping_command(event)
+
+        if canonical == "queue-status":
+            return await self._handle_queue_status_command(event)
 
         if canonical == "agents":
             return await self._handle_agents_command(event)
@@ -5581,6 +5596,23 @@ class GatewayRunner:
             logger.debug("Provider queue status unavailable: %s", exc)
 
         return "\n".join(lines)
+
+    async def _handle_ping_command(self, event: MessageEvent) -> str:
+        """Handle /ping without touching model/provider execution."""
+        return "pong"
+
+    async def _handle_queue_status_command(self, event: MessageEvent) -> str:
+        """Handle /queue-status command."""
+        try:
+            from gateway.provider_queue import ProviderQueue, format_snapshot
+
+            provider_queue = ProviderQueue.from_config(_load_gateway_config())
+            if provider_queue is None:
+                return "Provider queue is disabled."
+            return "\n".join(format_snapshot(provider_queue.snapshot()))
+        except Exception as exc:
+            logger.debug("Provider queue command unavailable: %s", exc)
+            return f"Provider queue status unavailable: {exc}"
 
     async def _handle_agents_command(self, event: MessageEvent) -> str:
         """Handle /agents command - list active agents and running tasks."""
@@ -10235,6 +10267,7 @@ class GatewayRunner:
                 from gateway.provider_queue import (
                     ProviderQueue,
                     ProviderQueueCancelled as _ProviderQueueCancelled,
+                    classify_provider_queue_priority,
                     format_start_notice,
                     format_wait_notice,
                     resolve_provider_account_identifier,
@@ -10260,6 +10293,7 @@ class GatewayRunner:
                         _queue_lane,
                         session_key=session_key,
                         source=source.platform.value if source.platform else "",
+                        priority=classify_provider_queue_priority(user_config, message=message),
                     )
                     _wait_notice_sent = [False]
 
