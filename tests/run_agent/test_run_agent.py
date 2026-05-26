@@ -3353,6 +3353,52 @@ class TestCredentialPoolRecovery:
         assert context["message"] == "Weekly credits exhausted."
         assert context["reset_at"] == "2026-04-12T10:30:00Z"
 
+    def test_account_quota_exhaustion_detects_codex_usage_limit(self, agent):
+        assert agent._is_account_quota_exhaustion(
+            provider="openai-codex",
+            classified_reason=FailoverReason.rate_limit,
+            error_context={
+                "reason": "usage_limit_reached",
+                "message": "The usage limit has been reached",
+                "reset_at": 1_780_172_220,
+            },
+        )
+        assert not agent._is_account_quota_exhaustion(
+            provider="anthropic",
+            classified_reason=FailoverReason.rate_limit,
+            error_context={"reason": "usage_limit_reached"},
+        )
+
+    def test_recover_with_pool_marks_all_codex_usage_limit_exhausted(self, agent):
+        captured = {}
+
+        class _Pool:
+            def mark_all_exhausted(self, *, status_code, error_context=None):
+                captured["status_code"] = status_code
+                captured["error_context"] = error_context
+                return 2
+
+        agent.provider = "openai-codex"
+        agent._credential_pool = _Pool()
+        agent._swap_credential = MagicMock()
+
+        recovered, retry_same = agent._recover_with_credential_pool(
+            status_code=429,
+            has_retried_429=False,
+            classified_reason=FailoverReason.rate_limit,
+            error_context={
+                "reason": "usage_limit_reached",
+                "message": "The usage limit has been reached",
+                "reset_at": 1_780_172_220,
+            },
+        )
+
+        assert recovered is False
+        assert retry_same is True
+        assert captured["status_code"] == 429
+        assert captured["error_context"]["reset_at"] == 1_780_172_220
+        agent._swap_credential.assert_not_called()
+
     def test_recover_with_pool_passes_error_context_on_rotated_429(self, agent):
         next_entry = SimpleNamespace(label="secondary")
         captured = {}

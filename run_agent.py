@@ -3809,6 +3809,49 @@ class AIAgent:
         return cleaned
 
     @staticmethod
+    def _is_account_quota_exhaustion(
+        *,
+        provider: str,
+        classified_reason: Optional[FailoverReason],
+        error_context: Optional[Dict[str, Any]],
+    ) -> bool:
+        """True for account-level subscription quotas that should not be retried."""
+        if (provider or "").strip().lower() != "openai-codex":
+            return False
+        if classified_reason not in (FailoverReason.rate_limit, FailoverReason.billing):
+            return False
+        if not isinstance(error_context, dict):
+            return False
+
+        reason = str(error_context.get("reason") or "").strip().lower()
+        message = str(error_context.get("message") or "").strip().lower()
+        if reason in {"usage_limit_reached", "subscription_limit", "device_code_exhausted"}:
+            return True
+        if "usage limit has been reached" in message:
+            return True
+        if "subscription limit" in message:
+            return True
+        if "weekly" in message and any(word in message for word in ("quota", "limit", "credits")):
+            return True
+        return False
+
+    @staticmethod
+    def _format_quota_reset_suffix(error_context: Optional[Dict[str, Any]]) -> str:
+        if not isinstance(error_context, dict):
+            return ""
+        reset_at = error_context.get("reset_at")
+        if reset_at in (None, ""):
+            return ""
+        try:
+            if isinstance(reset_at, (int, float)):
+                reset_text = datetime.fromtimestamp(float(reset_at)).isoformat(timespec="seconds")
+            else:
+                reset_text = str(reset_at)
+        except Exception:
+            reset_text = str(reset_at)
+        return f" Reset: {reset_text}."
+
+    @staticmethod
     def _extract_api_error_context(error: Exception) -> Dict[str, Any]:
         """Extract structured rate-limit details from provider errors."""
         context: Dict[str, Any] = {}
@@ -5792,6 +5835,30 @@ class AIAgent:
                 effective_reason = FailoverReason.rate_limit
             elif status_code in (401, 403):
                 effective_reason = FailoverReason.auth
+
+        if (
+            effective_reason == FailoverReason.rate_limit
+            and self._is_account_quota_exhaustion(
+                provider=getattr(self, "provider", "") or "",
+                classified_reason=effective_reason,
+                error_context=error_context,
+            )
+        ):
+            if hasattr(pool, "mark_all_exhausted"):
+                count = pool.mark_all_exhausted(
+                    status_code=status_code if status_code is not None else 429,
+                    error_context=error_context,
+                )
+            else:
+                count = 1 if pool.mark_exhausted_and_rotate(
+                    status_code=status_code if status_code is not None else 429,
+                    error_context=error_context,
+                ) is not None else 0
+            logger.warning(
+                "OpenAI Codex account quota exhausted; marked %s credential(s) exhausted until reset",
+                count,
+            )
+            return False, True
 
         if effective_reason == FailoverReason.billing:
             rotate_status = status_code if status_code is not None else 402
@@ -11183,6 +11250,35 @@ class AIAgent:
                     )
                     if recovered_with_pool:
                         continue
+
+                    account_quota_exhausted = self._is_account_quota_exhaustion(
+                        provider=getattr(self, "provider", "") or "",
+                        classified_reason=classified.reason,
+                        error_context=error_context,
+                    )
+                    if account_quota_exhausted:
+                        reset_suffix = self._format_quota_reset_suffix(error_context)
+                        self._emit_status(
+                            "❌ OpenAI Codex account usage limit reached; "
+                            f"not retrying this account.{reset_suffix}"
+                        )
+                        if self._try_activate_fallback(reason=classified.reason):
+                            retry_count = 0
+                            compression_attempts = 0
+                            primary_recovery_attempted = False
+                            continue
+                        self._persist_session(messages, conversation_history)
+                        return {
+                            "final_response": (
+                                "OpenAI Codex account usage limit reached; "
+                                f"stopped without further retries.{reset_suffix}"
+                            ),
+                            "messages": messages,
+                            "api_calls": api_call_count,
+                            "completed": False,
+                            "failed": True,
+                            "error": self._summarize_api_error(api_error),
+                        }
 
                     # Image-too-large recovery: shrink oversized native image
                     # parts in-place and retry once.  Triggered by Anthropic's

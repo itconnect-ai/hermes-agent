@@ -333,6 +333,60 @@ def test_mark_exhausted_and_rotate_persists_status(tmp_path, monkeypatch):
     assert persisted["last_error_code"] == 402
 
 
+def test_mark_all_exhausted_persists_reset_context(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    reset_at = time.time() + 7 * 24 * 60 * 60
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-1",
+                        "label": "primary",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": "tok-1",
+                    },
+                    {
+                        "id": "cred-2",
+                        "label": "secondary",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "manual:device_code",
+                        "access_token": "tok-2",
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    assert pool.select().id == "cred-1"
+
+    count = pool.mark_all_exhausted(
+        status_code=429,
+        error_context={
+            "reason": "usage_limit_reached",
+            "message": "The usage limit has been reached",
+            "reset_at": reset_at,
+        },
+    )
+
+    assert count == 2
+    assert pool.select() is None
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    for persisted in auth_payload["credential_pool"]["openai-codex"]:
+        assert persisted["last_status"] == "exhausted"
+        assert persisted["last_error_code"] == 429
+        assert persisted["last_error_reason"] == "usage_limit_reached"
+        assert persisted["last_error_reset_at"] == reset_at
+
+
 def test_load_pool_seeds_env_api_key(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-seeded")

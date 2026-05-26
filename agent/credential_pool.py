@@ -878,6 +878,27 @@ class CredentialPool:
                 logger.info("credential pool: rotated to %s", _next_label)
             return next_entry
 
+    def mark_all_exhausted(
+        self,
+        *,
+        status_code: Optional[int],
+        error_context: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """Mark every credential in this pool exhausted and clear selection."""
+        with self._lock:
+            count = 0
+            for entry in list(self._entries):
+                self._mark_exhausted(entry, status_code, error_context)
+                count += 1
+            self._current_id = None
+            if count:
+                logger.info(
+                    "credential pool: marked all %s credential(s) exhausted (status=%s)",
+                    count,
+                    status_code,
+                )
+            return count
+
     def acquire_lease(self, credential_id: Optional[str] = None) -> Optional[str]:
         """Acquire a soft lease on a credential.
 
